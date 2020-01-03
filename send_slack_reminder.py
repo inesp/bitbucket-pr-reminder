@@ -176,31 +176,40 @@ class PRIsMergeableResolver(object):
 
 
 class PRReminder(object):
-    @classmethod
-    def run(cls, limit=1000, pr_id=None):
+    @staticmethod
+    def _prepare_pr_objects(limit, pr_id, users):
         if pr_id:
             pr = PRFetcher.fetch_one_pr(pr_id)
-            all_prs = [pr] if pr else []
+            raw_prs = [pr] if pr else []
         else:
-            all_prs = PRFetcher.fetch_all_prs(limit)
+            raw_prs = PRFetcher.fetch_all_prs(limit)
+
+        all_prs = []
+        for pr_data in raw_prs:
+            pr = PRResolver(pr_data)
+
+            if users and pr.author_name in users:
+                all_prs.append(pr)
+
+        return all_prs
+
+    @classmethod
+    def run(cls, limit=1000, pr_id=None, users=None):
+        all_prs = cls._prepare_pr_objects(limit, pr_id, users)
 
         if not all_prs:
             print ("No open PRs found")
             return
 
         slack_msgs = []
-        for pr_data in all_prs:
-            pr = PRResolver(pr_data)
-
+        for pr in all_prs:
             people_to_ping = cls._collect_people_to_ping(pr)
-
-            if people_to_ping:
-                msg = MSG_TEMPLATE.format(
-                    people_to_ping=", ".join(people_to_ping),
-                    pr_link=pr.link,
-                    pr_title=pr.title,
-                )
-                slack_msgs.append(msg)
+            msg = MSG_TEMPLATE.format(
+                people_to_ping=", ".join(people_to_ping),
+                pr_link=pr.link,
+                pr_title=pr.title,
+            )
+            slack_msgs.append(msg)
 
         SlackHandler.send_reminders(slack_msgs)
 
@@ -251,6 +260,12 @@ if __name__ == "__main__":
         "--pr", "-p", type=int, help="PR ID. Generate a message for this PR only"
     )
     parser.add_argument(
+        "--users",
+        "-u",
+        nargs="+",
+        help="Usernames of users, whose open PRs we will process",
+    )
+    parser.add_argument(
         "--limit",
         "-l",
         type=int,
@@ -260,4 +275,4 @@ if __name__ == "__main__":
 
     arguments = parser.parse_args()
 
-    PRReminder.run(limit=arguments.limit, pr_id=arguments.pr)
+    PRReminder.run(limit=arguments.limit, pr_id=arguments.pr, users=arguments.users)
