@@ -3,108 +3,261 @@
 from __future__ import absolute_import
 from __future__ import print_function
 
+import argparse
 import requests
-import sys
 
-from secrets import BITBUCKET_REPO_LINK
-from secrets import BITBUCKET_TOKEN
-from secrets import BITBUCKET_USER_NAME_TO_SLACK_USER_NAME
-from secrets import BITBUCKET_USERNAME
-from secrets import SLACK_WEBHOOK_URL
+from local_scripts.secrets import BITBUCKET_API_REPO_LINK
+from local_scripts.secrets import BITBUCKET_REPO_LINK
+from local_scripts.secrets import BITBUCKET_TOKEN
+from local_scripts.secrets import BITBUCKET_USER_NAME_TO_SLACK_USER_NAME
+from local_scripts.secrets import BITBUCKET_USERNAME
+from local_scripts.secrets import SLACK_WEBHOOK_URL
 
 PR_BASE_LINK = "{repo}/pull-requests/{{pr_id}}/overview".format(
     repo=BITBUCKET_REPO_LINK
 )
 
+MSG_TEMPLATE = "<{pr_link}|{pr_title}>\nWaiting for: {people_to_ping}\n"
 
-def fetch_all_prs(pr_limit):
 
-    get_all_prs_url = "{repo_url}/pull-requests?state=OPEN&limit={limit}".format(
-        repo_url=BITBUCKET_REPO_LINK, limit=pr_limit
-    )
-    response = requests.get(get_all_prs_url, auth=(BITBUCKET_USERNAME, BITBUCKET_TOKEN))
+class PRFetcher(object):
+    @staticmethod
+    def _fetch_url(url):
+        response = requests.get(url, auth=(BITBUCKET_USERNAME, BITBUCKET_TOKEN))
 
-    if response.status_code != 200:
-        raise Exception(
-            "Could not connect to BitBucket repo. Response: {}".format(response.content)
+        if response.status_code != 200:
+            raise Exception(
+                "Could not connect to BitBucket repo. Response: {}".format(
+                    response.content
+                )
+            )
+
+        response_json = response.json()
+        if not response_json:
+            raise Exception("BitBucket returned an error: {}".format(response_json))
+
+        return response_json
+
+    @classmethod
+    def fetch_one_pr(cls, pr_id):
+        url = "{repo_url}/pull-requests/{pr_id}".format(
+            repo_url=BITBUCKET_API_REPO_LINK, pr_id=pr_id
         )
+        response_json = cls._fetch_url(url)
 
-    response_json = response.json()
-    if not response_json:
-        raise Exception("BitBucket returned an error: {}".format(response_json))
+        if response_json["state "] != "OPEN":
+            return None
 
-    all_prs = response_json["values"]
-    return all_prs
+        return response_json
 
+    @classmethod
+    def fetch_all_prs(cls, limit):
+        url = "{repo_url}/pull-requests?state=OPEN&limit={limit}".format(
+            repo_url=BITBUCKET_API_REPO_LINK, limit=limit
+        )
+        response_json = cls._fetch_url(url)
 
-def limit_to_my_prs(all_prs):
-    my_prs = [
-        pr for pr in all_prs if pr["author"]["user"]["name"] == BITBUCKET_USERNAME
-    ]
-    return my_prs
+        all_prs = response_json["values"]
+        return all_prs
 
+    @classmethod
+    def fetch_open_tasks(cls, pr_id):
+        # tasks can only be fetched per PR, there is no other bulk fecthing for tasks
+        url = "{repo_url}/pull-requests/{pr_id}/tasks".format(
+            repo_url=BITBUCKET_API_REPO_LINK, pr_id=pr_id
+        )
+        response_json = cls._fetch_url(url)
 
-def get_slack_username(bitbucket_username):
-    return BITBUCKET_USER_NAME_TO_SLACK_USER_NAME.get(
-        bitbucket_username, bitbucket_username
-    )
+        tasks = []
+        for raw_task in response_json.get("values", []):
+            if raw_task["state"] != "OPEN":
+                continue
 
+            tasks.append(raw_task["text"])
 
-def create_reminder_message_for(pr):
-    pr_link = PR_BASE_LINK.format(pr_id=pr["id"])
-    pr_title = pr["title"]
-    people_to_ping = set()
+        return tasks
 
-    for person in pr["reviewers"]:
-        if person["status"] == "UNAPPROVED":
-            reviewer_name = person["user"]["name"]
+    @classmethod
+    def fetch_mergeable_status(cls, pr_id):
+        # the merge-ability of a PR can only be fetched per PR, no bulk fetching available
+        url = "{repo_url}/pull-requests/{pr_id}/merge".format(
+            repo_url=BITBUCKET_API_REPO_LINK, pr_id=pr_id
+        )
+        response_json = cls._fetch_url(url)
 
-            slack_nick_name = get_slack_username(reviewer_name)
-            people_to_ping.add("@{}".format(slack_nick_name))
-
-    if not people_to_ping:
-        # the PR is waiting for ME
-        people_to_ping.add("@{}".format(get_slack_username(BITBUCKET_USERNAME)))
-
-    return "{people_to_ping} :pray: {pr_link} ({pr_title})".format(
-        people_to_ping=" ".join(people_to_ping), pr_link=pr_link, pr_title=pr_title
-    )
-
-
-def send_reminders_to_slack(slack_msgs):
-    response = requests.post(SLACK_WEBHOOK_URL, json={"text": "\n".join(slack_msgs)})
-    assert response.status_code == 200
+        return response_json
 
 
-def collect_all_reminder_messages(my_prs):
-    slack_msgs = []
-    for pr in my_prs:
-        msg = create_reminder_message_for(pr)
-        if msg is not None:
-            slack_msgs.append(msg)
-            print (msg)
+class SlackHandler(object):
+    @staticmethod
+    def get_slack_name_of(pr_user_name):
+        slack_nick_name = BITBUCKET_USER_NAME_TO_SLACK_USER_NAME.get(
+            pr_user_name, pr_user_name
+        )
+        return "@{}".format(slack_nick_name)
 
-    return slack_msgs
+    @staticmethod
+    def send_reminders(slack_msgs):
+        response = requests.post(
+            SLACK_WEBHOOK_URL, json={"text": "\n".join(slack_msgs)}
+        )
+        assert response.status_code == 200
 
 
-def send_pr_reminders_to_slack(pr_limit):
-    all_prs = fetch_all_prs(pr_limit)
-    my_prs = limit_to_my_prs(all_prs)
-    if not my_prs:
-        print ("You have no open PRs")
-        return
+class PRResolver(object):
+    def __init__(self, pr_data):
+        self.pr_data = pr_data
 
-    slack_msgs = collect_all_reminder_messages(my_prs)
-    send_reminders_to_slack(slack_msgs)
+    @property
+    def pr_id(self):
+        return self.pr_data["id"]
+
+    @property
+    def link(self):
+        return PR_BASE_LINK.format(pr_id=self.pr_data["id"])
+
+    @property
+    def title(self):
+        return self.pr_data["title"]
+
+    @property
+    def author_name(self):
+        return self.pr_data["author"]["user"]["name"]
+
+    def get_undone_reviewers(self):
+        people_to_ping = set()
+        for reviewer in self.pr_data["reviewers"]:
+            if reviewer["status"] == "UNAPPROVED":
+                reviewer_name = reviewer["user"]["name"]
+                people_to_ping.add(SlackHandler.get_slack_name_of(reviewer_name))
+
+        return people_to_ping
+
+
+class PRIsMergeableResolver(object):
+
+    VETO_REASONS_WE_IGNORE = {
+        "Requires approvals",  # we handle separatelly
+        "Requires all tasks to be resolved",  # we handle separetelly
+        "Insufficient branch permissions",  # irrelevant veto
+    }
+
+    VETO_BUILD_NOT_FINISHED = "Not all required builds are successful yet"
+
+    def __init__(self, pr_id):
+        self._merge_status = PRFetcher.fetch_mergeable_status(pr_id)
+
+        self._valid_vetos = set()
+        self.is_conflicted = False
+        self.builds_in_progress = False
+        self.builds_have_failed = False
+        self._resolve_reasons()
+
+    def _resolve_reasons(self):
+        self._valid_vetos = set()
+        self.is_conflicted = bool(self._merge_status["conflicted"])
+        for veto in self._merge_status["vetoes"]:
+            veto_msg = veto["summaryMessage"]
+
+            if veto_msg in self.VETO_REASONS_WE_IGNORE:
+                continue
+
+            if veto_msg == self.VETO_BUILD_NOT_FINISHED:
+                if "has failed builds" in veto["detailedMessage"]:
+                    self.builds_have_failed = True
+                else:
+                    self.builds_in_progress = True
+                continue
+
+            self._valid_vetos.add(veto_msg)
+
+    def merge_vetos(self):
+        return self._valid_vetos
+
+
+class PRReminder(object):
+    @classmethod
+    def run(cls, limit=1000, pr_id=None):
+        if pr_id:
+            pr = PRFetcher.fetch_one_pr(pr_id)
+            all_prs = [pr] if pr else []
+        else:
+            all_prs = PRFetcher.fetch_all_prs(limit)
+
+        if not all_prs:
+            print ("No open PRs found")
+            return
+
+        slack_msgs = []
+        for pr_data in all_prs:
+            pr = PRResolver(pr_data)
+
+            people_to_ping = cls._collect_people_to_ping(pr)
+
+            if people_to_ping:
+                msg = MSG_TEMPLATE.format(
+                    people_to_ping=", ".join(people_to_ping),
+                    pr_link=pr.link,
+                    pr_title=pr.title,
+                )
+                slack_msgs.append(msg)
+
+        SlackHandler.send_reminders(slack_msgs)
+
+    @staticmethod
+    def _collect_people_to_ping(pr):
+        pr_author = SlackHandler.get_slack_name_of(pr.author_name)
+
+        merge_status_resolver = PRIsMergeableResolver(pr.pr_id)
+        if merge_status_resolver.is_conflicted:
+            return {"{} (merge CONFLICT)".format(pr_author)}
+
+        if merge_status_resolver.builds_have_failed:
+            return {"{} (builds FAILED)".format(pr_author)}
+
+        authors_unfinished_work = set()
+        people_to_ping = set()
+
+        merge_vetos = merge_status_resolver.merge_vetos()
+        if merge_vetos:
+            authors_unfinished_work.update(merge_vetos)
+
+        undone_tasks = PRFetcher.fetch_open_tasks(pr.pr_id)
+        if undone_tasks:
+            authors_unfinished_work.add(
+                "open tasks: {}".format(" & ".join(undone_tasks))
+            )
+
+        people_to_ping.update(pr.get_undone_reviewers())
+
+        if authors_unfinished_work:
+            people_to_ping.add(
+                "{} ({})".format(pr_author, "; ".join(authors_unfinished_work))
+            )
+
+        if people_to_ping:
+            return people_to_ping
+
+        return {pr_author}
 
 
 if __name__ == "__main__":
 
-    if len(sys.argv) >= 2 and (sys.argv[1] == "--help" or sys.argv[1] == "-h"):
-        print (
-            "Fetch my OPEN PRs from Bitbucket, compose a reminder message "
-            "for PR reviewers and send it to Slack."
-        )
-        exit()
+    parser = argparse.ArgumentParser(
+        usage="Fetch OPEN PRs from Bitbucket, compose a reminder message "
+        "for PR reviewers and send it to Slack."
+    )
+    parser.add_argument(
+        "--pr", "-p", type=int, help="PR ID. Generate a message for this PR only"
+    )
+    parser.add_argument(
+        "--limit",
+        "-l",
+        type=int,
+        default=1000,
+        help="Limit to only this many PRs. Default: 1000.",
+    )
 
-    send_pr_reminders_to_slack(pr_limit=100)
+    arguments = parser.parse_args()
+
+    PRReminder.run(limit=arguments.limit, pr_id=arguments.pr)
